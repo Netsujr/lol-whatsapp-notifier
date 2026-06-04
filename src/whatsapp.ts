@@ -1,9 +1,13 @@
+import { existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import makeWASocket, {
   DisconnectReason,
+  fetchLatestBaileysVersion,
   useMultiFileAuthState,
+  Browsers,
   type WASocket,
+  type WAVersion,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
@@ -15,8 +19,11 @@ const AUTH_DIR = join(
   "auth_info",
 );
 
-let socket: WASocket | null = null;
-let connecting: Promise<WASocket> | null = null;
+const FALLBACK_WA_VERSION: WAVersion = [2, 3000, 1027934701];
+const CONNECT_TIMEOUT_MS = 180_000;
+
+let currentSock: WASocket | null = null;
+let connectPromise: Promise<WASocket> | null = null;
 
 function requireWhatsAppNumber(): string {
   const raw = process.env.WHATSAPP_NUMBER;
@@ -30,25 +37,67 @@ function toJid(phoneDigits: string): string {
   return `${phoneDigits}@s.whatsapp.net`;
 }
 
-async function createSocket(): Promise<WASocket> {
+function hasSavedSession(): boolean {
+  if (!existsSync(AUTH_DIR)) {
+    return false;
+  }
+  return readdirSync(AUTH_DIR).length > 0;
+}
+
+function isConnected(sock: WASocket | null): sock is WASocket {
+  return sock !== null && sock.user !== undefined;
+}
+
+async function resolveWaVersion(): Promise<WAVersion> {
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(
+      `WhatsApp Web version: ${version.join(".")}${isLatest ? " (latest)" : ""}`,
+    );
+    return version;
+  } catch {
+    console.warn(
+      `Could not fetch latest WhatsApp version; using fallback ${FALLBACK_WA_VERSION.join(".")}`,
+    );
+    return FALLBACK_WA_VERSION;
+  }
+}
+
+function logDisconnect(lastDisconnect: { error?: Error } | undefined): void {
+  const boom = lastDisconnect?.error as Boom | undefined;
+  const statusCode = boom?.output?.statusCode;
+  const message = boom?.message ?? "unknown";
+  console.log(`WhatsApp connection closed (code ${statusCode ?? "?"}): ${message}`);
+}
+
+async function startWhatsApp(): Promise<WASocket> {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  const version = await resolveWaVersion();
   const logger = pino({ level: "silent" });
 
   const sock = makeWASocket({
+    version,
     auth: state,
     logger,
+    browser: Browsers.macOS("Chrome"),
     printQRInTerminal: false,
+    connectTimeoutMs: 60_000,
+    qrTimeout: 60_000,
+    markOnlineOnConnect: false,
   });
 
+  currentSock = sock;
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
-      console.log("\nScan this QR code with WhatsApp (Linked Devices):\n");
+      console.log("\nScan this QR with WhatsApp → Linked devices:\n");
       qrcode.generate(qr, { small: true });
-      console.log("");
+      console.log(
+        "\nQR expires in ~60s. If pairing fails, wait for a new QR (do not restart).\n",
+      );
     }
 
     if (connection === "open") {
@@ -56,78 +105,82 @@ async function createSocket(): Promise<WASocket> {
     }
 
     if (connection === "close") {
+      logDisconnect(lastDisconnect);
+
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output
         ?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-      if (loggedOut) {
-        console.error("WhatsApp logged out. Delete auth_info/ and scan QR again.");
-        socket = null;
-        connecting = null;
+      if (statusCode === DisconnectReason.loggedOut) {
+        console.error(
+          "Logged out. Delete auth_info/ and run again to scan a new QR.",
+        );
+        currentSock = null;
+        connectPromise = null;
         return;
       }
 
-      console.log("WhatsApp disconnected. Reconnecting...");
-      socket = null;
-      connecting = createSocket()
-        .then((s) => {
-          socket = s;
-          return s;
-        })
-        .catch((err: unknown) => {
-          connecting = null;
-          throw err;
-        });
+      const shouldReconnect =
+        statusCode === DisconnectReason.restartRequired ||
+        statusCode === DisconnectReason.timedOut ||
+        hasSavedSession();
+
+      if (shouldReconnect) {
+        console.log("Reconnecting in 3s...");
+        currentSock = null;
+        setTimeout(() => {
+          connectPromise = bootWhatsApp();
+        }, 3000);
+      }
     }
   });
 
   return sock;
 }
 
-export async function connectWhatsApp(): Promise<WASocket> {
-  if (socket) {
-    return socket;
-  }
-  if (connecting) {
-    return connecting;
+/** Waits until any socket in this process is fully logged in. */
+function waitUntilLoggedIn(): Promise<WASocket> {
+  if (isConnected(currentSock)) {
+    return Promise.resolve(currentSock);
   }
 
-  connecting = createSocket().then((sock) => {
-    socket = sock;
-    return sock;
-  });
-
-  const sock = await connecting;
-  connecting = null;
-
-  // Wait until the connection is ready before sending.
-  await new Promise<void>((resolve, reject) => {
-    if (sock.user) {
-      resolve();
-      return;
-    }
-
+  return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
-      reject(new Error("WhatsApp connection timed out. Scan the QR code."));
-    }, 120_000);
+      reject(
+        new Error(
+          "WhatsApp connection timed out. Scan the QR code or check auth_info/.",
+        ),
+      );
+    }, CONNECT_TIMEOUT_MS);
 
-    sock.ev.on("connection.update", (update) => {
-      if (update.connection === "open") {
+    const tick = setInterval(() => {
+      if (isConnected(currentSock)) {
         clearTimeout(timeout);
-        resolve();
+        clearInterval(tick);
+        resolve(currentSock);
       }
-      if (update.connection === "close") {
-        const code = (update.lastDisconnect?.error as Boom | undefined)?.output
-          ?.statusCode;
-        if (code === DisconnectReason.loggedOut) {
-          clearTimeout(timeout);
-          reject(new Error("WhatsApp logged out."));
-        }
-      }
-    });
+    }, 200);
   });
+}
 
-  return sock;
+function bootWhatsApp(): Promise<WASocket> {
+  return startWhatsApp().then(() => waitUntilLoggedIn());
+}
+
+export async function connectWhatsApp(): Promise<WASocket> {
+  if (isConnected(currentSock)) {
+    return currentSock;
+  }
+
+  if (!connectPromise) {
+    connectPromise = bootWhatsApp();
+  }
+
+  try {
+    return await connectPromise;
+  } catch (error) {
+    connectPromise = null;
+    throw error;
+  }
 }
 
 export async function sendWhatsAppMessage(text: string): Promise<void> {

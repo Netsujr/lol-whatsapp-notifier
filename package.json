@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node --loader ts-node/esm src/index.ts",
+    "test:message": "node --loader ts-node/esm src/test-message.ts",
+    "test:whatsapp": "node --loader ts-node/esm src/test-whatsapp.ts",
     "build": "tsc",
     "start": "node dist/index.js"
   },
@@ -12,7 +14,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "@whiskeysockets/baileys": "^6.7.23",
     "axios": "^1.17.0",
     "dotenv": "^17.4.2",
     "node-cron": "^4.2.1",

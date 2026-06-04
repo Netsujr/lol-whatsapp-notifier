@@ -24,6 +24,7 @@ const CONNECT_TIMEOUT_MS = 180_000;
 
 let currentSock: WASocket | null = null;
 let connectPromise: Promise<WASocket> | null = null;
+let connectionIsOpen = false;
 
 function requireWhatsAppNumber(): string {
   const raw = process.env.WHATSAPP_NUMBER;
@@ -45,7 +46,9 @@ function hasSavedSession(): boolean {
 }
 
 function isConnected(sock: WASocket | null): sock is WASocket {
-  return sock !== null && sock.user !== undefined;
+  return (
+    sock !== null && sock.user !== undefined && connectionIsOpen
+  );
 }
 
 async function resolveWaVersion(): Promise<WAVersion> {
@@ -86,6 +89,7 @@ async function startWhatsApp(): Promise<WASocket> {
     markOnlineOnConnect: false,
   });
 
+  connectionIsOpen = false;
   currentSock = sock;
   sock.ev.on("creds.update", saveCreds);
 
@@ -101,10 +105,12 @@ async function startWhatsApp(): Promise<WASocket> {
     }
 
     if (connection === "open") {
+      connectionIsOpen = true;
       console.log("WhatsApp connected.");
     }
 
     if (connection === "close") {
+      connectionIsOpen = false;
       logDisconnect(lastDisconnect);
 
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output
@@ -116,13 +122,26 @@ async function startWhatsApp(): Promise<WASocket> {
         );
         currentSock = null;
         connectPromise = null;
+        connectionIsOpen = false;
+        return;
+      }
+
+      if (statusCode === DisconnectReason.connectionReplaced) {
+        console.error(
+          "Another WhatsApp Web session took over (conflict). " +
+            "Stop other instances (pm2, npm run dev, test scripts) and close " +
+            "web.whatsapp.com in the browser, then restart this app once.",
+        );
+        currentSock = null;
+        connectPromise = null;
         return;
       }
 
       const shouldReconnect =
         statusCode === DisconnectReason.restartRequired ||
         statusCode === DisconnectReason.timedOut ||
-        hasSavedSession();
+        (hasSavedSession() &&
+          statusCode !== DisconnectReason.connectionReplaced);
 
       if (shouldReconnect) {
         console.log("Reconnecting in 3s...");
